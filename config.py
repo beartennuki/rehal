@@ -9,7 +9,7 @@ class Config:
         env_type = os.getenv('REHAL_ENV_TYPE')
         if env_type is None:
             raise EnvironmentError('REHAL_ENV_TYPE is not set')
-        if env_type not in ['PROD', 'TEST']:
+        if env_type not in ['PROD', 'DEV']:
             raise EnvironmentError(f'Unknown REHAL_ENV_TYPE setting : {env_type}')
 
         if os.getenv('MONGO_URI') is None:

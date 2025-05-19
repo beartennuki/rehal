@@ -26,7 +26,7 @@ class UpdateMCQ:
         eval_id = update_dic['eval_id']
         user_id = update_dic['user_id']
 
-        max_attempts = 5
+        max_attempts = 12
         attempt = 0
         new_version = None
 
@@ -103,7 +103,7 @@ class UpdateMCQ:
             except Exception as e:
                 # Print error and wait briefly before retrying.
                 print(f"Attempt {attempt} failed: {e}")
-                time.sleep(0.1)
+                time.sleep(10)
                 continue
 
         # If we reach here, no update succeeded after max_attempts.
