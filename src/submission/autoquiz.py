@@ -10,6 +10,7 @@ from openai import APIConnectionError, APIError, Timeout
 from src.mongodbhandler import MongoDBHandler
 from src.moderation import Moderation
 from src.ids import IDGenerator
+from src.credits import Credit
 from config import Config
 
 
@@ -168,6 +169,12 @@ class ATQ:
 
     def start(self, submit_info):
 
+        user_id = submit_info['user_id']
+        credits_obj = Credit()
+        credit_validation = credits_obj.validate_credit(user_id, 'quiz_generation')
+        if not credit_validation:
+            return {"status": "FAILED", "message": "Not enough credit or expired"}
+
         respond = self.give_question_packet(submit_info)
         if respond['status'] == 'FAILED':
             return respond
@@ -262,6 +269,8 @@ class ATQ:
 
         mongoio = MongoDBHandler(self.cfg.eval_mongo_db_name, self.cfg.mongo_collection_mcq_name)
         mongoio.write_document(mcq_doc)
+
+        _ = Credit().subtract_credit(user_id, 'quiz_generation')
 
         return {"status": "SUCCESS",
                 "message": "Autoquiz has been saved",

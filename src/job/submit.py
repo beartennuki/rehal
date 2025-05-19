@@ -20,6 +20,8 @@ def submit_job(self, data):
         respond = autoquiz.ATQ().start(submit_info)
     elif submission_type == 'assessment':
         respond = assessment.Assessment().start(submit_info)
+    elif submission_type == 'reassessment':
+        respond = assessment.Assessment().reassessment(submit_info)
     else:
         msg = 'Unknown submission type'
         self.update_state(state='FAILURE', meta={'message': msg})

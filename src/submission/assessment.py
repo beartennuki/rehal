@@ -9,6 +9,7 @@ from openai import APIConnectionError, APIError, Timeout
 
 from src.mongodbhandler import MongoDBHandler
 from src.update.update_mcq import UpdateMCQ
+from src.credits import Credit
 from config import Config
 
 
@@ -248,6 +249,11 @@ class Assessment:
         assessment_id = submit_info.get('assessment_id', None)
         responds_dic = submit_info.get('responds', None)
 
+        credits_obj = Credit()
+        credit_validation = credits_obj.validate_credit(user_id, 'assessment_generation')
+        if not credit_validation:
+            return {"status": "FAILED", "message": "Not enough credit or expired"}
+
         assessment_info = self.evaluate_answer(eval_id, responds_dic)
 
         acc = assessment_info['accuracy']
@@ -255,9 +261,20 @@ class Assessment:
         wrong_ls = assessment_info['wrong_ls']
         dont_know_ls = assessment_info['dont_know_questions']
 
-        respond = self.generate_advice(acc, correct_ls, wrong_ls, dont_know_ls)
-        if respond['status'] == 'FAILED':
-            return respond
+        if responds_dic["summaryType"] == 'personalized':
+            respond = self.generate_advice(acc, correct_ls, wrong_ls, dont_know_ls)
+            if respond['status'] == 'FAILED':
+                return respond
+            respond['advice_dict']['requested'] = True
+
+        elif responds_dic["summaryType"] == 'quick':
+            respond = {
+                'advice_dict':          {'requested': False},
+                'request_time_info':    {'requested': False},
+                'usage_dict':           {'requested': False},
+            }
+        else:
+            raise ValueError(f'Unknown summaryType: {responds_dic["summaryType"]}')
 
         advice_dict = respond['advice_dict']
         request_time_info = respond['request_time_info']
@@ -291,10 +308,84 @@ class Assessment:
             'user_id': user_id}
 
         #TODO make this a celery task
-        #update the mongo doc using threat
         update_obj = UpdateMCQ()
         thread = threading.Thread(target=update_obj.update_quiz_doc, args=(result_dic,))
         thread.daemon = True
         thread.start()
 
+        _ = Credit().subtract_credit(user_id, 'assessment_generation')
+
         return result_dic
+
+    def reassessment(self, resubmit_info):
+
+        assessment_id = resubmit_info.get('assessment_id', None)
+        user_id = resubmit_info.get('user_id', None)
+
+        credits_obj = Credit()
+        credit_validation = credits_obj.validate_credit(user_id, 'assessment_generation')
+        if not credit_validation:
+            return {"status": "FAILED", "message": "Not enough credit or expired"}
+
+        dbname = self.cfg.assess_mongo_db_name
+        clcname = self.cfg.mongo_collection_mcq_name
+        mongoio = MongoDBHandler(dbname, clcname)
+        assessment_doc, version = mongoio.load_assessment_document(assessment_id)
+
+        eval_id = assessment_doc['meta']['eval_id']
+        creation_date_human = assessment_doc['meta']['creation_date_human']
+        creation_time = assessment_doc['meta']['creation_time']
+
+        assessmend_info = assessment_doc['assessment_info']
+        acc = assessmend_info['accuracy']
+        correct_ls = assessmend_info['correct_ls']
+        wrong_ls = assessmend_info['wrong_ls']
+        dont_know_ls = assessmend_info['dont_know_questions']
+
+        respond = self.generate_advice(acc, correct_ls, wrong_ls, dont_know_ls)
+
+        if respond['status'] == 'FAILED':
+            return respond
+        respond['advice_dict']['requested'] = True
+
+        advice_dict = respond['advice_dict']
+        request_time_info = respond['request_time_info']
+        usage_dict = respond['usage_dict']
+
+        meta_dict = {
+            "eval_id": eval_id,
+            'assessment_id': assessment_id,
+            "creation_date_human": creation_date_human,
+            "creation_time": creation_time,
+            'generating_time_info': request_time_info,
+            'token_usage': usage_dict,
+            'load_time_stamp': [time.time()],
+            'user_id': user_id
+        }
+
+        #TODO make it try 3 times if update failed
+        # updating meta
+        new_ctr_version = mongoio.safe_update_document(
+            doc_id=assessment_id,
+            update_fields={"meta": meta_dict},
+            expected_version=version
+        )
+
+        # updating advice info
+        _ = mongoio.safe_update_document(
+            doc_id=assessment_id,
+            update_fields={"advice_dict": advice_dict},
+            expected_version=new_ctr_version
+        )
+
+        result_dic = {
+            "status": "SUCCESS",
+            "message": "Advice dict has been saved",
+            "assessment_id": assessment_id,
+            'eval_id': eval_id,
+            'user_id': user_id}
+
+        _ = Credit().subtract_credit(user_id, 'assessment_generation')
+
+        return result_dic
+

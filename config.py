@@ -12,10 +12,22 @@ class Config:
         if env_type not in ['PROD', 'TEST']:
             raise EnvironmentError(f'Unknown REHAL_ENV_TYPE setting : {env_type}')
 
+        if os.getenv('MONGO_URI') is None:
+            raise EnvironmentError('MONGO_URI')
+        self.mongo_uri = os.getenv('MONGO_URI')
+
         self.eval_mongo_db_name = env_type + '_EVAL_REHAL_DB'
         self.assess_mongo_db_name = env_type + '_ASSESS_REHAL_DB'
+        self.auth_mongo_db_name = env_type + '_AUTH_REHAL_DB'
+        self.user_mongo_db_name = env_type + '_USER_REHAL_DB'
 
         self.mongo_collection_mcq_name = env_type + '_mcq'
+        self.user_collection_name = 'users'
 
-        self.mongo_uri = "mongodb://localhost:27017"
+        self.credit_cost = {
+            'quiz_generation':          5,
+            'assessment_generation':    5
+        }
+
+
 

@@ -72,6 +72,8 @@ async def get_db_config():
     db_config = {
         'eval_db_name': cfg.eval_mongo_db_name,
         'assess_db_name': cfg.assess_mongo_db_name,
+        'auth_db_name': cfg.auth_mongo_db_name,
+        'user_db_name': cfg.user_mongo_db_name,
         'mcq_collection_name': cfg.mongo_collection_mcq_name,
         'uri': cfg.mongo_uri
     }

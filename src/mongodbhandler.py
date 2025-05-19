@@ -135,30 +135,30 @@ class MongoDBHandler:
         """
         Safely updates a document using optimistic concurrency control (eager version control).
 
-        It updates the document identified by meta.doc_id only if its current version
-        (stored in control.version) matches the provided expected_version. If successful,
-        it merges the update_fields, generates a new version, and appends the current time to control.time_ls.
+        It updates the document identified by either meta.assessment_id or meta.eval_id
+        only if its current version (stored in control.version) matches the provided expected_version.
+        If successful, it merges the update_fields, generates a new version, and appends the current time to control.time_ls.
 
-        :param doc_id: The document ID stored in meta.doc_id.
+        :param doc_id: The document ID (either assessment_id or eval_id).
         :param update_fields: A dict containing the fields to update.
         :param expected_version: The version of the document that the caller expects.
         :return: The new version string if the update is successful.
-        :raises Exception: If no document is updated (i.e. due to a version conflict).
+        :raises Exception: If no document is updated (i.e., due to a version conflict or document not found).
         """
-        # Generate a new version
         new_version = uuid4().hex
 
-        # Build the filter: match on meta.doc_id and the expected control.version
-        filter_query = {"meta.doc_id": doc_id, "control.version": expected_version}
+        # Try matching eval_id first, if not, fall back to assessment_id
+        filter_query = {
+            "$or": [
+                {"meta.eval_id": doc_id},
+                {"meta.assessment_id": doc_id}
+            ],
+            "control.version": expected_version
+        }
 
-        # Merge update_fields and set the new version.
-        # This assumes update_fields is a flat dict; adjust if nested fields need special handling.
         update_set = update_fields.copy()
         update_set["control.version"] = new_version
 
-        # Prepare the update operation:
-        # - $set: update fields and new version.
-        # - $push: append the current timestamp to control.time_ls.
         update_op = {
             "$set": update_set,
             "$push": {"control.time_ls": time.time()}

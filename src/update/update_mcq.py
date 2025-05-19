@@ -26,7 +26,7 @@ class UpdateMCQ:
         eval_id = update_dic['eval_id']
         user_id = update_dic['user_id']
 
-        max_attempts = 100
+        max_attempts = 5
         attempt = 0
         new_version = None
 
