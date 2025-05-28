@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 supervisord.log
 todo
+set_prod_env.sh
+.env
