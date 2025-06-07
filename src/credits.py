@@ -1,6 +1,5 @@
 import pymongo
 from datetime import datetime, timezone
-
 from config import Config
 
 

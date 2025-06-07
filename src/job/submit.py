@@ -13,8 +13,10 @@ def submit_job(self, data):
     # ---------- basic validation ----------
     submit_info = data.get("submit_info")
     if not submit_info:
-        err = {"status": "FAILED", "message": "Bad request – no submit_info"}
-        self.update_state(state="FAILURE", meta=err)   # save details for clients
+        err_msg = "Bad request – no submit_info"
+        # FIX: Added exc_type and exc_message for Celery backend compatibility
+        err_meta = {"status": "FAILED", "message": err_msg, "exc_type": "ValueError", "exc_message": err_msg}
+        self.update_state(state="FAILURE", meta=err_meta)   # save details for clients
         raise Ignore()                                 # stop task without a second write
 
     submission_type = submit_info.get("submit_type")
@@ -25,16 +27,28 @@ def submit_job(self, data):
     elif submission_type == "reassessment":
         respond = assessment.Assessment().reassessment(submit_info)
     else:
-        err = {"status": "FAILED", "message": "Unknown submission type"}
-        self.update_state(state="FAILURE", meta=err)
+        err_msg = "Unknown submission type"
+        # FIX: Added exc_type and exc_message for Celery backend compatibility
+        err_meta = {"status": "FAILED", "message": err_msg, "exc_type": "ValueError", "exc_message": err_msg}
+        self.update_state(state="FAILURE", meta=err_meta)
         raise Ignore()
 
     # ---------- normal end-of-task handling ----------
     if respond.get("status") == "FAILED":
-        # keep the full error dict in the backend
-        self.update_state(state="FAILURE", meta=respond)
+        # When a sub-process (autoquiz/assessment) returns FAILED,
+        # propagate its message and ensure exc_type is present for Celery backend.
+        respond_meta = respond.copy()
+        if "exc_type" not in respond_meta:
+            respond_meta["exc_type"] = "ApplicationError" # Generic error type
+        if "exc_message" not in respond_meta and "message" in respond_meta:
+            respond_meta["exc_message"] = respond_meta["message"]
+        elif "exc_message" not in respond_meta:
+            respond_meta["exc_message"] = "Task failed with unspecific error message." # Fallback
+
+        self.update_state(state="FAILURE", meta=respond_meta)
         raise Ignore()
 
     # SUCCESS path → just return the dictionary
     # Celery will write one final SUCCESS record that contains this dict.
     return respond
+
