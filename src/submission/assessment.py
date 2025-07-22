@@ -249,11 +249,6 @@ class Assessment:
         assessment_id = submit_info.get('assessment_id', None)
         responds_dic = submit_info.get('responds', None)
 
-        credits_obj = Credit()
-        credit_validation = credits_obj.validate_credit(user_id, 'assessment_generation')
-        if not credit_validation:
-            return {"status": "FAILED", "message": "Not enough credit or expired"}
-
         assessment_info = self.evaluate_answer(eval_id, responds_dic)
 
         acc = assessment_info['accuracy']
@@ -262,6 +257,12 @@ class Assessment:
         dont_know_ls = assessment_info['dont_know_questions']
 
         if responds_dic["summaryType"] == 'personalized':
+
+            credits_obj = Credit()
+            credit_validation = credits_obj.validate_credit(user_id, 'assessment_generation')
+            if not credit_validation:
+                return {"status": "FAILED", "message": "Not enough credit or expired"}
+
             respond = self.generate_advice(acc, correct_ls, wrong_ls, dont_know_ls)
             if respond['status'] == 'FAILED':
                 return respond
