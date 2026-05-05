@@ -5,7 +5,7 @@ import random
 from datetime import datetime
 
 from openai import OpenAI
-from openai import APIConnectionError, APIError, Timeout
+from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 from src.mongodbhandler import MongoDBHandler
 from src.moderation import Moderation
@@ -20,66 +20,85 @@ class ATQ:
         self.client = OpenAI()
         self.model = "o3-mini-2025-01-31"
         self.max_retries = 3
-        self.mcq_tools = [
-                            {
-                                "type": "function",
-                                "function": {
-                                    "name": "generate_mcqs",
-                                    "parameters": {
-                                        "type": "object",
-                                        "properties": {
-                                            "title": {"type": "string"},
-                                            "genre": {
-                                                "type": "string",
-                                                "enum": [
-                                                    "business",
-                                                    "administration",
-                                                    "finance",
-                                                    "science",
-                                                    "medical",
-                                                    "technology",
-                                                    "creativity",
-                                                    "law",
-                                                    "culture"
-                                                ]
-                                            },
-                                            "sub_genre": {"type": "string"},
-                                            "general_info": {
-                                                "type": "string",
-                                                "description": "Indicate what topic is covered in this quiz"
-                                            },
-                                            "questions": {
-                                                "type": "array",
-                                                "items": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "question": {"type": "string"},
-                                                        "choices_list": {
-                                                            "type": "array",
-                                                            "items": {"type": "string"},
-                                                            "minItems": 4,
-                                                            "maxItems": 4
-                                                        },
-                                                        "correct_answer_index": {"type": "integer"},
-                                                        "explanation": {"type": "string"},
-                                                    },
-                                                    "required": [
-                                                        "question",
-                                                        "choices",
-                                                        "correct_answer",
-                                                        "explanation"
-                                                    ],
-                                                    "additionalProperties": False
-                                                },
-                                                "minItems": 1
-                                            }
-                                        },
-                                        "required": ["genre", "sub_genre", "questions"],
-                                        "additionalProperties": False
-                                    },
-                                },
-                            }
-                        ]
+        self.mcq_schema = {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "genre": {
+                    "type": "string",
+                    "enum": [
+                        "business",
+                        "administration",
+                        "finance",
+                        "science",
+                        "medical",
+                        "technology",
+                        "creativity",
+                        "law",
+                        "culture"
+                    ]
+                },
+                "sub_genre": {"type": "string"},
+                "general_info": {
+                    "type": "string",
+                    "description": "Indicate what topic is covered in this quiz"
+                },
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string"},
+                            "choices_list": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 4,
+                                "maxItems": 4
+                            },
+                            "correct_answer_index": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 3
+                            },
+                            "explanation": {"type": "string"}
+                        },
+                        "required": [
+                            "question",
+                            "choices_list",
+                            "correct_answer_index",
+                            "explanation"
+                        ],
+                        "additionalProperties": False
+                    },
+                    "minItems": 1
+                }
+            },
+            "required": ["title", "genre", "sub_genre", "questions"],
+            "additionalProperties": False
+        }
+
+    def _generate_structured_response(self, instructions, user_context, schema_name, schema):
+        response = self.client.responses.create(
+            model=self.model,
+            instructions=instructions,
+            input=user_context,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "schema": schema,
+                    "strict": True
+                }
+            }
+        )
+
+        output_text = getattr(response, "output_text", None)
+        if not output_text:
+            raise ValueError("Model returned no structured output.")
+
+        usage = getattr(response, "usage", None)
+        usage_dict = usage.model_dump() if usage else {}
+        return json.loads(output_text), usage_dict
 
     def give_question_packet(self, submit_info):
 
@@ -98,52 +117,30 @@ class ATQ:
 
         text_inputs = f'{topic_question} , {description_question}'
         flagged = Moderation().text_check(text_inputs)
-        if flagged:
+        if flagged is True:
             return {"status": "FAILED", "message": "Content flagged as inappropriate."}
 
-        # Build system message
-        messages = [
-            {
-                "role": "system",
-                "content": (f""" 
-                Generate {num_questions} different multiple-choice question about {topic_question} 
-                at {level_question} level. The questions must have mix of theorytical, applied and 
-                scenarios if applicable.
-                In the answer list, include one correct answer, two incorrect answers, and one misleadingly 
-                close but wrong answer.
-                Avoid question or answer that involves mathematical equations or coding text
-                """
-                )
-            }
-        ]
-
-        # Add additional user-provided description if available
-        if description_question:
-            messages.append({
-                "role": "user",
-                "content": description_question
-            })
+        instructions = (
+            f"Generate {num_questions} different multiple-choice questions about {topic_question} "
+            f"at {level_question} level. Mix theoretical, applied, and scenario-based questions when applicable. "
+            "Each question must have exactly four choices in choices_list, with exactly one correct answer index. "
+            "Include one correct answer, two clearly incorrect answers, and one plausible but wrong distractor. "
+            "Avoid questions or answers involving mathematical equations or coding text. "
+            "Return valid JSON matching the provided schema."
+        )
+        user_context = description_question or f"Topic: {topic_question}"
 
         retry_count = 0
         while retry_count < self.max_retries:
             try:
                 start_request_time = time.time()
-                completion = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=self.mcq_tools
+                mcq_dict, usage_dict = self._generate_structured_response(
+                    instructions=instructions,
+                    user_context=user_context,
+                    schema_name="generate_mcqs",
+                    schema=self.mcq_schema
                 )
                 end_request_time = time.time()
-                arguments = completion.choices[0].message.tool_calls[0].function.arguments
-                usage = completion.usage.model_dump_json()
-                try:
-                    mcq_dict = json.loads(arguments)
-                    usage_dict = json.loads(usage)
-                except json.JSONDecodeError:
-                    # Retry if JSON parsing fails
-                    retry_count += 1
-                    time.sleep(1)
-                    continue
 
                 # Successfully parsed and validated response
                 request_time_info = {
@@ -156,7 +153,11 @@ class ATQ:
                         'usage_dict': usage_dict,
                         'request_time_info': request_time_info}
 
-            except (APIConnectionError, APIError, Timeout) as conn_err:
+            except (APIConnectionError, APIError, APITimeoutError, RateLimitError):
+                retry_count += 1
+                time.sleep(1)
+                continue
+            except json.JSONDecodeError:
                 retry_count += 1
                 time.sleep(1)
                 continue

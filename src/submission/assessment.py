@@ -5,7 +5,7 @@ import threading
 from datetime import datetime
 
 from openai import OpenAI
-from openai import APIConnectionError, APIError, Timeout
+from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 from src.mongodbhandler import MongoDBHandler
 from src.update.update_mcq import UpdateMCQ
@@ -19,64 +19,75 @@ class Assessment:
         self.client = OpenAI()
         self.model = "gpt-4o"
         self.max_retries = 3
-        self.assessment_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "assess_user_result",
-                    "parameters": {
+        self.assessment_schema = {
+            "type": "object",
+            "properties": {
+                "weak_points": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of topics or areas where the user demonstrated weaker understanding."
+                },
+                "strong_points": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of topics or areas where the user showed strong knowledge."
+                },
+                "new_topics": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "items": {
                         "type": "object",
                         "properties": {
-                            "weak_points": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of topics or areas where the user demonstrated weaker understanding."
-                            },
-
-                            "strong_points": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of topics or areas where the user showed strong knowledge."
-                            },
-
-                            "new_topics": {
-                                "type": "array",
-                                "minItems": 3,
-                                "maxItems": 3,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "topic": {"type": "string"},
-                                        "description": {"type": "string"},
-                                        "recommendation": {
-                                            "type": "string",
-                                            "enum": ["revision", "new"],
-                                            "description": "Indicates whether this topic should be revised or if it is a new area to explore."
-                                        },
-                                        "level":{
-                                            "type": "string",
-                                            "enum": ["beginner", "intermediate", "expert"],
-                                            "description": "assign an appropriate level for the user"
-                                        }
-                                    },
-
-                                    "required": ["topic", "description", "recommendation"],
-                                    "additionalProperties": False
-                                },
-
-                                "description": "Three new topics with descriptions and recommendations for revision or further exploration."
-                            },
-                            "advice": {
+                            "topic": {"type": "string"},
+                            "description": {"type": "string"},
+                            "recommendation": {
                                 "type": "string",
-                                "description": "General summary advice based on the user's results."
+                                "enum": ["revision", "new"],
+                                "description": "Indicates whether this topic should be revised or if it is a new area to explore."
+                            },
+                            "level": {
+                                "type": "string",
+                                "enum": ["beginner", "intermediate", "expert"],
+                                "description": "Assign an appropriate level for the user."
                             }
                         },
-
-                        "required": ["weak_points", "strong_points", "new_topics", "advice"],
+                        "required": ["topic", "description", "recommendation", "level"],
                         "additionalProperties": False
-                    }
+                    },
+                    "description": "Three new topics with descriptions and recommendations for revision or further exploration."
+                },
+                "advice": {
+                    "type": "string",
+                    "description": "General summary advice based on the user's results."
                 }
-            }]
+            },
+            "required": ["weak_points", "strong_points", "new_topics", "advice"],
+            "additionalProperties": False
+        }
+
+    def _generate_structured_response(self, instructions, user_context, schema_name, schema):
+        response = self.client.responses.create(
+            model=self.model,
+            instructions=instructions,
+            input=user_context,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "schema": schema,
+                    "strict": True
+                }
+            }
+        )
+
+        output_text = getattr(response, "output_text", None)
+        if not output_text:
+            raise ValueError("Model returned no structured output.")
+
+        usage = getattr(response, "usage", None)
+        usage_dict = usage.model_dump() if usage else {}
+        return json.loads(output_text), usage_dict
 
     def evaluate_answer(self, eval_id, responds_dic):
         # establishing db connection
@@ -158,66 +169,30 @@ class Assessment:
 
     def generate_advice(self, user_accuracy, correct_ls, wrong_ls, dont_know_ls):
 
-        messages = [
+        instructions = (
+            f"Based on the assessment results, provide direct but friendly guidance for the user. "
+            f"The user obtained an accuracy of {user_accuracy:.2%}. "
+            "Return valid JSON matching the provided schema."
+        )
+        user_context = json.dumps(
             {
-                "role": "system",
-                "content":
-                    f""" 
-                    Base on the following assessment resullts, provide guidance toward the user on how he can improve
-                    his knowledge on the subject matter. Be straight foward in giving advice in a friendly manner. 
-                    User obtained an accuracy of {user_accuracy} for the test. 
-                    """
+                "correct_answers": correct_ls if len(correct_ls) > 0 else [],
+                "wrong_answers": wrong_ls if len(wrong_ls) > 0 else [],
+                "dont_know_questions": dont_know_ls if len(dont_know_ls) > 0 else []
             }
-        ]
-        if len(correct_ls) > 0:
-            correct_msg = {
-                "role": "user",
-                "content": f"Correct answer from the user: {correct_ls}."
-            }
-        else:
-            correct_msg = {
-                "role": "user",
-                "content": f"User did not give any correct answer."
-            }
-        messages.append(correct_msg)
-
-        if len(wrong_ls) > 0:
-            wrong_msg = {
-                "role": "user",
-                "content": f"Wrong answer from the user: {wrong_ls}."
-            }
-            messages.append(wrong_msg)
-
-        if len(dont_know_ls) > 0:
-            dontknow_msg = {
-                "role": "user",
-                "content": f"The user mark the following question as dont-know"
-                           f": {dont_know_ls}."
-            }
-            messages.append(dontknow_msg)
+        )
 
         retry_count = 0
         while retry_count < self.max_retries:
             try:
                 start_request_time = time.time()
-
-                completion = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=self.assessment_tools
+                advice_dict, usage_dict = self._generate_structured_response(
+                    instructions=instructions,
+                    user_context=user_context,
+                    schema_name="assess_user_result",
+                    schema=self.assessment_schema
                 )
                 end_request_time = time.time()
-                arguments = completion.choices[0].message.tool_calls[0].function.arguments
-                usage = completion.usage.model_dump_json()
-
-                try:
-                    advice_dict = json.loads(arguments)
-                    usage_dict = json.loads(usage)
-                except json.JSONDecodeError:
-                    # Retry if JSON parsing fails
-                    retry_count += 1
-                    time.sleep(1)
-                    continue
 
                 # Successfully parsed and validated response
                 request_time_info = {
@@ -230,7 +205,11 @@ class Assessment:
                         'usage_dict': usage_dict,
                         'request_time_info': request_time_info}
 
-            except (APIConnectionError, APIError, Timeout) as conn_err:
+            except (APIConnectionError, APIError, APITimeoutError, RateLimitError):
+                retry_count += 1
+                time.sleep(1)
+                continue
+            except json.JSONDecodeError:
                 retry_count += 1
                 time.sleep(1)
                 continue
@@ -389,4 +368,3 @@ class Assessment:
         _ = Credit().subtract_credit(user_id, 'assessment_generation')
 
         return result_dic
-

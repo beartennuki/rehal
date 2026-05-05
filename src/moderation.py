@@ -5,6 +5,7 @@ class Moderation:
         self.model = "omni-moderation-latest"
 
     def text_check(self, text):
+
         response = self.client.moderations.create(
             model=self.model,
             input=text

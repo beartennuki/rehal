@@ -1,4 +1,6 @@
 # app.py
+import os
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -8,6 +10,9 @@ from celery_app import celery_app
 from src.job.submit import submit_job
 from src.job.retrieve import retrieve_doc
 from config import Config
+from env import load_rehal_env
+
+load_rehal_env()
 
 app = FastAPI()
 
@@ -80,11 +85,15 @@ async def get_db_config():
         'auth_db_name': cfg.auth_mongo_db_name,
         'user_db_name': cfg.user_mongo_db_name,
         'mcq_collection_name': cfg.mongo_collection_mcq_name,
-        'uri': cfg.mongo_uri
     }
 
     return JSONResponse(content=db_config)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=5500, reload=True)
+    uvicorn.run(
+        "app_fast:app",
+        host=os.getenv("REHAL_HOST", "0.0.0.0"),
+        port=int(os.getenv("REHAL_PORT", "5500")),
+        reload=os.getenv("REHAL_RELOAD", "false").strip().lower() in {"1", "true", "yes", "on"}
+    )

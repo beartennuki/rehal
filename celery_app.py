@@ -1,12 +1,22 @@
-from celery import Celery
-from dotenv import load_dotenv
+import os
 
-load_dotenv()
+from celery import Celery
+from env import load_rehal_env
+
+load_rehal_env()
+
+redis_broker_url = os.getenv("REDIS_BROKER_URL")
+if not redis_broker_url:
+    raise EnvironmentError("REDIS_BROKER_URL is not set")
+
+redis_result_backend = os.getenv("REDIS_RESULT_BACKEND")
+if not redis_result_backend:
+    raise EnvironmentError("REDIS_RESULT_BACKEND is not set")
 
 celery_app = Celery(
     "rehal",
-    broker="redis://localhost:6379/0",
-    backend="redis://localhost:6379/1",
+    broker=redis_broker_url,
+    backend=redis_result_backend,
 )
 
 celery_app.conf.update(
