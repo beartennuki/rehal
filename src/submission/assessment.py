@@ -3,9 +3,11 @@ import json
 import time
 import threading
 from datetime import datetime
+from typing import Literal
 
 from openai import OpenAI
-from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
+from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, RateLimitError
+from pydantic import BaseModel
 
 from src.mongodbhandler import MongoDBHandler
 from src.update.update_mcq import UpdateMCQ
@@ -13,81 +15,87 @@ from src.credits import Credit
 from config import Config
 
 
+class TopicRecommendation(BaseModel):
+    topic: str
+    description: str
+    recommendation: Literal["revision", "new"]
+    level: Literal["beginner", "intermediate", "expert"]
+
+
+class AssessmentResponse(BaseModel):
+    weak_points: list[str]
+    strong_points: list[str]
+    new_topics: list[TopicRecommendation]
+    advice: str
+
+
 class Assessment:
     def __init__(self):
         self.cfg = Config()
         self.client = OpenAI()
-        self.model = "gpt-4o"
+        self.model = self.cfg.openai_assessment_model
         self.max_retries = 3
-        self.assessment_schema = {
-            "type": "object",
-            "properties": {
-                "weak_points": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of topics or areas where the user demonstrated weaker understanding."
-                },
-                "strong_points": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of topics or areas where the user showed strong knowledge."
-                },
-                "new_topics": {
-                    "type": "array",
-                    "minItems": 3,
-                    "maxItems": 3,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "topic": {"type": "string"},
-                            "description": {"type": "string"},
-                            "recommendation": {
-                                "type": "string",
-                                "enum": ["revision", "new"],
-                                "description": "Indicates whether this topic should be revised or if it is a new area to explore."
-                            },
-                            "level": {
-                                "type": "string",
-                                "enum": ["beginner", "intermediate", "expert"],
-                                "description": "Assign an appropriate level for the user."
-                            }
-                        },
-                        "required": ["topic", "description", "recommendation", "level"],
-                        "additionalProperties": False
-                    },
-                    "description": "Three new topics with descriptions and recommendations for revision or further exploration."
-                },
-                "advice": {
-                    "type": "string",
-                    "description": "General summary advice based on the user's results."
-                }
-            },
-            "required": ["weak_points", "strong_points", "new_topics", "advice"],
-            "additionalProperties": False
-        }
 
-    def _generate_structured_response(self, instructions, user_context, schema_name, schema):
-        response = self.client.responses.create(
+    def _generate_structured_response(self, instructions, user_context):
+        response = self.client.responses.parse(
             model=self.model,
             instructions=instructions,
-            input=user_context,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": schema_name,
-                    "schema": schema,
-                    "strict": True
+            input=[
+                {
+                    "role": "user",
+                    "content": user_context,
                 }
-            }
+            ],
+            text_format=AssessmentResponse,
         )
 
-        output_text = getattr(response, "output_text", None)
-        if not output_text:
+        refusal = self._extract_refusal(response)
+        if refusal:
+            raise ValueError(f"Model refused request: {refusal}")
+
+        parsed = getattr(response, "output_parsed", None)
+        if not parsed:
             raise ValueError("Model returned no structured output.")
+
+        self._validate_assessment_response(parsed)
 
         usage = getattr(response, "usage", None)
         usage_dict = usage.model_dump() if usage else {}
-        return json.loads(output_text), usage_dict
+        return parsed.model_dump(), usage_dict
+
+    @staticmethod
+    def _format_openai_error(exc):
+        body = getattr(exc, "body", None)
+        request_id = getattr(exc, "request_id", None)
+        detail = body if body is not None else str(exc)
+
+        if request_id:
+            return f"OpenAI request failed: {detail} (request_id={request_id})"
+        return f"OpenAI request failed: {detail}"
+
+    @staticmethod
+    def _extract_refusal(response):
+        for item in getattr(response, "output", []):
+            if getattr(item, "type", None) != "message":
+                continue
+
+            for content in getattr(item, "content", []):
+                if getattr(content, "type", None) == "refusal":
+                    return content.refusal
+
+        return None
+
+    def _validate_assessment_response(self, parsed):
+        if len(parsed.new_topics) != 3:
+            raise ValueError("Assessment must return exactly 3 new topics.")
+
+        parsed.weak_points = [point.strip() for point in parsed.weak_points]
+        parsed.strong_points = [point.strip() for point in parsed.strong_points]
+        parsed.advice = parsed.advice.strip()
+
+        for topic in parsed.new_topics:
+            topic.topic = topic.topic.strip()
+            topic.description = topic.description.strip()
 
     def evaluate_answer(self, eval_id, responds_dic):
         # establishing db connection
@@ -189,8 +197,6 @@ class Assessment:
                 advice_dict, usage_dict = self._generate_structured_response(
                     instructions=instructions,
                     user_context=user_context,
-                    schema_name="assess_user_result",
-                    schema=self.assessment_schema
                 )
                 end_request_time = time.time()
 
@@ -205,14 +211,14 @@ class Assessment:
                         'usage_dict': usage_dict,
                         'request_time_info': request_time_info}
 
-            except (APIConnectionError, APIError, APITimeoutError, RateLimitError):
+            except BadRequestError as exc:
+                return {"status": "FAILED", "message": self._format_openai_error(exc)}
+            except (APIConnectionError, APITimeoutError, RateLimitError):
                 retry_count += 1
                 time.sleep(1)
                 continue
-            except json.JSONDecodeError:
-                retry_count += 1
-                time.sleep(1)
-                continue
+            except APIError as exc:
+                return {"status": "FAILED", "message": self._format_openai_error(exc)}
             except Exception as e:
                 # Catch any other exception and return a failed response immediately
                 return {"status": "FAILED", "message": str(e)}

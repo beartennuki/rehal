@@ -1,6 +1,9 @@
+from celery.utils.log import get_task_logger
 from celery.exceptions import Ignore
 from celery_app import celery_app
 from src.submission import autoquiz, assessment
+
+logger = get_task_logger(__name__)
 
 """
 Handle all submission status here.
@@ -16,6 +19,7 @@ def submit_job(self, data):
         err_msg = "Bad request – no submit_info"
         # FIX: Added exc_type and exc_message for Celery backend compatibility
         err_meta = {"status": "FAILED", "message": err_msg, "exc_type": "ValueError", "exc_message": err_msg}
+        logger.error("submit_job failed before dispatch: %s", err_msg)
         self.update_state(state="FAILURE", meta=err_meta)   # save details for clients
         raise Ignore()                                 # stop task without a second write
 
@@ -30,6 +34,7 @@ def submit_job(self, data):
         err_msg = "Unknown submission type"
         # FIX: Added exc_type and exc_message for Celery backend compatibility
         err_meta = {"status": "FAILED", "message": err_msg, "exc_type": "ValueError", "exc_message": err_msg}
+        logger.error("submit_job failed before dispatch: %s", err_msg)
         self.update_state(state="FAILURE", meta=err_meta)
         raise Ignore()
 
@@ -45,10 +50,20 @@ def submit_job(self, data):
         elif "exc_message" not in respond_meta:
             respond_meta["exc_message"] = "Task failed with unspecific error message." # Fallback
 
+        logger.error(
+            "submit_job failed: submission_type=%s doc_id=%s message=%s",
+            submission_type,
+            submit_info.get("doc_id"),
+            respond_meta.get("message"),
+        )
         self.update_state(state="FAILURE", meta=respond_meta)
         raise Ignore()
 
     # SUCCESS path → just return the dictionary
     # Celery will write one final SUCCESS record that contains this dict.
+    logger.info(
+        "submit_job succeeded: submission_type=%s doc_id=%s",
+        submission_type,
+        respond.get("doc_id") or submit_info.get("doc_id"),
+    )
     return respond
-

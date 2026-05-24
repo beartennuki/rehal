@@ -1,11 +1,11 @@
-import json
 import time
 import copy
 import random
 from datetime import datetime
 
 from openai import OpenAI
-from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
+from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, RateLimitError
+from pydantic import BaseModel
 
 from src.mongodbhandler import MongoDBHandler
 from src.moderation import Moderation
@@ -14,91 +14,111 @@ from src.credits import Credit
 from config import Config
 
 
+class MCQQuestion(BaseModel):
+    question: str
+    choices_list: list[str]
+    correct_answer_index: int
+    explanation: str
+
+
+class MCQResponse(BaseModel):
+    title: str
+    genre: str
+    sub_genre: str
+    general_info: str = ""
+    questions: list[MCQQuestion]
+
+
 class ATQ:
     def __init__(self):
         self.cfg = Config()
         self.client = OpenAI()
-        self.model = "o3-mini-2025-01-31"
+        self.model = self.cfg.openai_autoquiz_model
         self.max_retries = 3
-        self.mcq_schema = {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "genre": {
-                    "type": "string",
-                    "enum": [
-                        "business",
-                        "administration",
-                        "finance",
-                        "science",
-                        "medical",
-                        "technology",
-                        "creativity",
-                        "law",
-                        "culture"
-                    ]
-                },
-                "sub_genre": {"type": "string"},
-                "general_info": {
-                    "type": "string",
-                    "description": "Indicate what topic is covered in this quiz"
-                },
-                "questions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": {"type": "string"},
-                            "choices_list": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "minItems": 4,
-                                "maxItems": 4
-                            },
-                            "correct_answer_index": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": 3
-                            },
-                            "explanation": {"type": "string"}
-                        },
-                        "required": [
-                            "question",
-                            "choices_list",
-                            "correct_answer_index",
-                            "explanation"
-                        ],
-                        "additionalProperties": False
-                    },
-                    "minItems": 1
-                }
-            },
-            "required": ["title", "genre", "sub_genre", "questions"],
-            "additionalProperties": False
+        self.valid_genres = {
+            "business",
+            "administration",
+            "finance",
+            "science",
+            "medical",
+            "technology",
+            "creativity",
+            "law",
+            "culture",
         }
 
-    def _generate_structured_response(self, instructions, user_context, schema_name, schema):
-        response = self.client.responses.create(
+    def _generate_structured_response(self, instructions, user_context):
+        response = self.client.responses.parse(
             model=self.model,
             instructions=instructions,
-            input=user_context,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": schema_name,
-                    "schema": schema,
-                    "strict": True
+            input=[
+                {
+                    "role": "user",
+                    "content": user_context,
                 }
-            }
+            ],
+            text_format=MCQResponse,
         )
 
-        output_text = getattr(response, "output_text", None)
-        if not output_text:
+        refusal = self._extract_refusal(response)
+        if refusal:
+            raise ValueError(f"Model refused request: {refusal}")
+
+        parsed = getattr(response, "output_parsed", None)
+        if not parsed:
             raise ValueError("Model returned no structured output.")
+
+        self._validate_mcq_response(parsed)
 
         usage = getattr(response, "usage", None)
         usage_dict = usage.model_dump() if usage else {}
-        return json.loads(output_text), usage_dict
+        return parsed.model_dump(), usage_dict
+
+    @staticmethod
+    def _format_openai_error(exc):
+        body = getattr(exc, "body", None)
+        request_id = getattr(exc, "request_id", None)
+        detail = body if body is not None else str(exc)
+
+        if request_id:
+            return f"OpenAI request failed: {detail} (request_id={request_id})"
+        return f"OpenAI request failed: {detail}"
+
+    @staticmethod
+    def _extract_refusal(response):
+        for item in getattr(response, "output", []):
+            if getattr(item, "type", None) != "message":
+                continue
+
+            for content in getattr(item, "content", []):
+                if getattr(content, "type", None) == "refusal":
+                    return content.refusal
+
+        return None
+
+    def _validate_mcq_response(self, parsed):
+        normalized_genre = parsed.genre.strip().lower()
+        if normalized_genre not in self.valid_genres:
+            raise ValueError(f"Model returned unsupported genre: {parsed.genre}")
+        parsed.genre = normalized_genre
+
+        parsed.sub_genre = parsed.sub_genre.strip()
+        parsed.title = parsed.title.strip()
+        parsed.general_info = parsed.general_info.strip()
+
+        if not parsed.questions:
+            raise ValueError("Model returned no questions.")
+
+        for question in parsed.questions:
+            question.question = question.question.strip()
+            question.explanation = question.explanation.strip()
+            question.choices_list = [choice.strip() for choice in question.choices_list]
+
+            if len(question.choices_list) != 4:
+                raise ValueError("Each question must contain exactly 4 choices.")
+
+            if question.correct_answer_index < 0 or question.correct_answer_index >= len(question.choices_list):
+                raise ValueError("Question returned an invalid correct_answer_index.")
 
     def give_question_packet(self, submit_info):
 
@@ -116,7 +136,11 @@ class ATQ:
             return {"status": "FAILED", "message": "Internal MongoDB is offline"}
 
         text_inputs = f'{topic_question} , {description_question}'
-        flagged = Moderation().text_check(text_inputs)
+        try:
+            flagged = Moderation().text_check(text_inputs)
+        except RuntimeError as exc:
+            return {"status": "FAILED", "message": str(exc)}
+
         if flagged is True:
             return {"status": "FAILED", "message": "Content flagged as inappropriate."}
 
@@ -137,8 +161,6 @@ class ATQ:
                 mcq_dict, usage_dict = self._generate_structured_response(
                     instructions=instructions,
                     user_context=user_context,
-                    schema_name="generate_mcqs",
-                    schema=self.mcq_schema
                 )
                 end_request_time = time.time()
 
@@ -153,14 +175,14 @@ class ATQ:
                         'usage_dict': usage_dict,
                         'request_time_info': request_time_info}
 
-            except (APIConnectionError, APIError, APITimeoutError, RateLimitError):
+            except BadRequestError as exc:
+                return {"status": "FAILED", "message": self._format_openai_error(exc)}
+            except (APIConnectionError, APITimeoutError, RateLimitError):
                 retry_count += 1
                 time.sleep(1)
                 continue
-            except json.JSONDecodeError:
-                retry_count += 1
-                time.sleep(1)
-                continue
+            except APIError as exc:
+                return {"status": "FAILED", "message": self._format_openai_error(exc)}
             except Exception as e:
                 # Catch any other exception and return a failed response immediately
                 return {"status": "FAILED", "message": str(e)}

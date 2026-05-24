@@ -1,6 +1,7 @@
 # bismillahhirahmanirahim
 import os
 
+
 class Config:
     def __init__(self):
         if os.getenv('OPENAI_API_KEY') is None:
@@ -23,11 +24,13 @@ class Config:
 
         self.mongo_collection_mcq_name = env_type + '_mcq'
         self.user_collection_name = 'users'
+        self.openai_autoquiz_model = os.getenv('OPENAI_AUTOQUIZ_MODEL', 'gpt-4o-mini')
+        self.openai_assessment_model = os.getenv('OPENAI_ASSESSMENT_MODEL', 'gpt-4o')
+        self.openai_moderation_model = os.getenv('OPENAI_MODERATION_MODEL', 'omni-moderation-latest')
 
         self.credit_cost = {
             'quiz_generation':          5,
             'assessment_generation':    5
         }
-
 
 

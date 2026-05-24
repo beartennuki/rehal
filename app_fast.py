@@ -45,7 +45,8 @@ async def job_status(task_id: str):
         "task_id": task_id,
         "state": task.state,
         "status": result.get("status"),
-        "msg": result.get("message")
+        "msg": result.get("message"),
+        "meta": result,
     }
     return JSONResponse(content=response, status_code=200)
 
