@@ -80,6 +80,7 @@ async def job_result(request: Request):
 async def get_db_config():
     cfg = Config()
     db_config = {
+        'uri': cfg.mongo_uri,
         'eval_db_name': cfg.eval_mongo_db_name,
         'assess_db_name': cfg.assess_mongo_db_name,
         'auth_db_name': cfg.auth_mongo_db_name,
