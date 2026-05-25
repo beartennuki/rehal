@@ -87,6 +87,10 @@ async def get_db_config():
         'auth_db_name': cfg.auth_mongo_db_name,
         'user_db_name': cfg.user_mongo_db_name,
         'mcq_collection_name': cfg.mongo_collection_mcq_name,
+        'canonical_topic_db_name': cfg.canonical_topic_mongo_db_name,
+        'canonical_topic_collection_name': cfg.canonical_topic_collection_name,
+        'generated_article_db_name': cfg.generated_article_mongo_db_name,
+        'generated_article_collection_name': cfg.generated_article_collection_name,
     }
 
     return JSONResponse(content=db_config)

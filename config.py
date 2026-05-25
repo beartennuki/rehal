@@ -32,6 +32,14 @@ class Config:
             'CANONICAL_TOPIC_COLLECTION_NAME',
             os.getenv('POOL_COLLECTION_NAME', env_type + '_canonical_topic')
         )
+        self.generated_article_mongo_db_name = os.getenv(
+            'GENERATED_ARTICLE_MONGO_DB_NAME',
+            env_type + '_ARTICLE_REHAL_DB'
+        )
+        self.generated_article_collection_name = os.getenv(
+            'GENERATED_ARTICLE_COLLECTION_NAME',
+            env_type + '_generated_article'
+        )
         self.tavily_api_key = os.getenv('TAVILY_API_KEY')
 
         self.openai_autoquiz_model = os.getenv('OPENAI_AUTOQUIZ_MODEL', 'gpt-4o-mini')
@@ -48,6 +56,22 @@ class Config:
         self.openai_canonical_topic_embedding_model = os.getenv(
             'OPENAI_CANONICAL_TOPIC_EMBEDDING_MODEL',
             os.getenv('OPENAI_POOL_EMBEDDING_MODEL', 'text-embedding-3-small')
+        )
+        self.openai_article_outline_model = os.getenv(
+            'OPENAI_ARTICLE_OUTLINE_MODEL',
+            self.openai_canonical_topic_json_model
+        )
+        self.openai_article_writer_model = os.getenv(
+            'OPENAI_ARTICLE_WRITER_MODEL',
+            self.openai_canonical_topic_writer_model
+        )
+        self.openai_article_intro_model = os.getenv(
+            'OPENAI_ARTICLE_INTRO_MODEL',
+            self.openai_canonical_topic_json_model
+        )
+        self.openai_article_embedding_model = os.getenv(
+            'OPENAI_ARTICLE_EMBEDDING_MODEL',
+            self.openai_canonical_topic_embedding_model
         )
 
         self.canonical_topic_min_subtopics = int(os.getenv('CANONICAL_TOPIC_MIN_SUBTOPICS', os.getenv('POOL_MIN_SUBTOPICS', '4')))

@@ -1,7 +1,7 @@
 from celery.utils.log import get_task_logger
 from celery.exceptions import Ignore
 from celery_app import celery_app
-from src.submission import autoquiz, assessment, canonical_topic
+from src.submission import article_generation, autoquiz, assessment, canonical_topic
 
 logger = get_task_logger(__name__)
 
@@ -32,6 +32,8 @@ def submit_job(self, data):
         respond = assessment.Assessment().reassessment(submit_info)
     elif submission_type == "build_canonical_topic":
         respond = canonical_topic.BuildCanonicalTopic(task=self).start(submit_info)
+    elif submission_type == "generate_article":
+        respond = article_generation.GenerateArticle(task=self).start(submit_info)
     else:
         err_msg = "Unknown submission type"
         # FIX: Added exc_type and exc_message for Celery backend compatibility
