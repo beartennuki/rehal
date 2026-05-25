@@ -41,6 +41,7 @@ supervisor==4.2.5
 tqdm==4.67.1
 typing_extensions==4.15.0
 tzdata==2025.1
+tavily-python==0.7.24
 urllib3==2.3.0
 uvicorn==0.34.0
 vine==5.1.0
