@@ -13,6 +13,7 @@ from openai import APIConnectionError, APIError, APITimeoutError, BadRequestErro
 
 from config import Config
 from src.mongodbhandler import MongoDBHandler
+from src.submission.article_quality import ArticleQualityChecker
 
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ class GenerateArticle:
         self.claim_bank: List[Dict[str, Any]] = []
         self.claim_id_to_claim: Dict[str, Dict[str, Any]] = {}
         self.sid_to_url: Dict[str, str] = {}
+        self.quality_checker: ArticleQualityChecker = ArticleQualityChecker({}, {}, [])
 
     def start(self, submit_info: Dict[str, Any]) -> Dict[str, Any]:
         started_at = time.time()
@@ -103,6 +105,7 @@ class GenerateArticle:
         }
         last_quality = None
         attempt_history: List[Dict[str, Any]] = []
+        embedding_doc_id = None
 
         try:
             validated_submit_info = self._run_stage(
@@ -119,8 +122,12 @@ class GenerateArticle:
                 self.cfg.generated_article_mongo_db_name,
                 self.cfg.generated_article_collection_name,
             )
+            embedding_mongo = MongoDBHandler(
+                self.cfg.generated_article_mongo_db_name,
+                self.cfg.article_embedding_collection_name,
+            )
 
-            if not canonical_mongo.is_online() or not article_mongo.is_online():
+            if not canonical_mongo.is_online() or not article_mongo.is_online() or not embedding_mongo.is_online():
                 raise ArticleGenerationError(
                     "Internal MongoDB is offline",
                     error_code="MONGO_ERROR",
@@ -137,6 +144,18 @@ class GenerateArticle:
                 "extracting_claim_bank",
                 lambda: self._build_source_context(canonical_doc, settings["embedding_model"]),
             )
+
+            try:
+                embedding_doc_id = str(self._persist_embedding_document(
+                    self._build_embedding_document(article_id, validated_submit_info, source_context, settings),
+                    embedding_mongo,
+                ))
+            except ArticleGenerationError as exc:
+                logger.warning(
+                    "generate_article failed to persist embedding document: article_id=%s error=%s",
+                    article_id,
+                    exc.message,
+                )
 
             outline = self._run_stage(
                 "generating_outline",
@@ -165,7 +184,11 @@ class GenerateArticle:
 
             retrieval = self._run_stage(
                 "filtering_claims",
-                lambda: self.merge_and_filter_retrieval(raw_retrieval, settings["near_duplicate_threshold"]),
+                lambda: self.merge_and_filter_retrieval(
+                    raw_retrieval,
+                    settings["near_duplicate_threshold"],
+                    settings["max_claims_per_section"],
+                ),
             )
 
             for attempt_number in range(1, self.MAX_REPAIR_ATTEMPTS + 1):
@@ -180,7 +203,7 @@ class GenerateArticle:
                             difficulty_level=validated_submit_info["difficulty_level"],
                             personal_remarks=validated_submit_info["personal_remarks"],
                             writer_model=settings["writer_model"],
-                            target_words_per_section=settings["target_words_per_section"],
+                            target_word_count=settings["target_word_count"],
                         ),
                         attempt_number=attempt_number,
                         max_attempts=self.MAX_REPAIR_ATTEMPTS,
@@ -214,7 +237,7 @@ class GenerateArticle:
                             personal_remarks=validated_submit_info["personal_remarks"],
                             writer_model=settings["writer_model"],
                             intro_model=settings["intro_model"],
-                            target_words_per_section=settings["target_words_per_section"],
+                            target_word_count=settings["target_word_count"],
                             attempt_number=attempt_number,
                         ),
                         attempt_number=attempt_number,
@@ -236,16 +259,37 @@ class GenerateArticle:
 
                 quality = self._run_stage(
                     "quality_check",
-                    lambda: self.run_quality_checks(
+                    lambda: self.run_quality_checks_with_openai(
                         retrieval=retrieval,
                         body_sections=body_sections,
                         intro_conclusion=intro_conclusion,
-                        article_with_claim_ids=rendered["article_with_claim_ids"],
-                        article_with_sources=rendered["article_with_sources"],
+                        rendered=rendered,
+                        qa_model=settings["qa_model"],
                     ),
                     attempt_number=attempt_number,
                     max_attempts=self.MAX_REPAIR_ATTEMPTS,
                 )
+
+                if "untagged_factual_sentences" in quality["failures"]:
+                    body_sections, intro_conclusion = self.repair_untagged_paragraphs_with_openai(
+                        retrieval=retrieval,
+                        body_sections=body_sections,
+                        intro_conclusion=intro_conclusion,
+                        findings=quality["findings"],
+                        writer_model=settings["writer_model"],
+                    )
+                    rendered = self.render_article(
+                        topic=source_context["topic"],
+                        body_sections=body_sections,
+                        intro_conclusion=intro_conclusion,
+                    )
+                    quality = self.run_quality_checks_with_openai(
+                        retrieval=retrieval,
+                        body_sections=body_sections,
+                        intro_conclusion=intro_conclusion,
+                        rendered=rendered,
+                        qa_model=settings["qa_model"],
+                    )
 
                 last_body_sections = body_sections
                 last_intro_conclusion = intro_conclusion
@@ -289,12 +333,13 @@ class GenerateArticle:
                 body_sections=last_body_sections,
                 intro_conclusion=last_intro_conclusion,
                 rendered=last_rendered,
-                quality=last_quality or self.build_exception_quality("No quality results were produced"),
+                quality=last_quality or self.quality_checker.build_exception_quality("No quality results were produced"),
                 attempt_history=attempt_history,
                 status=final_status,
                 final_error_code=None if final_status == "completed" else "QUALITY_CHECK_FAILED",
                 final_failed_stage=None if final_status == "completed" else "quality_check",
                 total_runtime_seconds=round(time.time() - started_at, 3),
+                embedding_doc_id=embedding_doc_id,
             )
 
             persist_started_at = time.time()
@@ -326,7 +371,7 @@ class GenerateArticle:
                     "section_count": len(last_body_sections),
                     "attempt_count": len(attempt_history),
                     "max_attempts": self.MAX_REPAIR_ATTEMPTS,
-                    "quality_summary": self.build_quality_summary(last_quality),
+                    "quality_summary": self.quality_checker.build_quality_summary(last_quality),
                 }
 
             logger.error(
@@ -351,7 +396,7 @@ class GenerateArticle:
                 "attempt_count": len(attempt_history),
                 "max_attempts": self.MAX_REPAIR_ATTEMPTS,
                 "qa_required": True,
-                "quality_summary": self.build_quality_summary(last_quality),
+                "quality_summary": self.quality_checker.build_quality_summary(last_quality),
             }
         except ArticleGenerationError as exc:
             if validated_submit_info and source_context and (attempt_history or last_rendered["article_with_claim_ids"] or last_body_sections):
@@ -373,12 +418,13 @@ class GenerateArticle:
                             body_sections=last_body_sections,
                             intro_conclusion=last_intro_conclusion,
                             rendered=last_rendered,
-                            quality=last_quality or self.build_exception_quality(exc.message),
+                            quality=last_quality or self.quality_checker.build_exception_quality(exc.message),
                             attempt_history=attempt_history,
                             status="failed",
                             final_error_code=exc.error_code,
                             final_failed_stage=exc.failed_stage,
                             total_runtime_seconds=round(time.time() - started_at, 3),
+                            embedding_doc_id=embedding_doc_id,
                         ),
                         article_mongo,
                     )
@@ -389,7 +435,7 @@ class GenerateArticle:
                         "attempt_count": len(attempt_history),
                         "max_attempts": self.MAX_REPAIR_ATTEMPTS,
                         "qa_required": True,
-                        "quality_summary": self.build_quality_summary(last_quality or self.build_exception_quality(exc.message)),
+                        "quality_summary": self.quality_checker.build_quality_summary(last_quality or self.quality_checker.build_exception_quality(exc.message)),
                     })
                     return failure_dict
                 except ArticleGenerationError as persist_exc:
@@ -448,29 +494,50 @@ class GenerateArticle:
                 exc_type="ValueError",
             )
 
+        default_word_count = {"beginner": 350, "intermediate": 800, "expert": 1500}[difficulty_level]
+        raw_word_count = submit_info.get("word_count")
+        if raw_word_count is None:
+            word_count = default_word_count
+        else:
+            try:
+                word_count = int(raw_word_count)
+            except (TypeError, ValueError):
+                raise ArticleGenerationError(
+                    "word_count must be an integer",
+                    error_code="VALIDATION_ERROR",
+                    failed_stage="validating_input",
+                    retryable=False,
+                    exc_type="ValueError",
+                )
+            if not (350 <= word_count <= 2500):
+                raise ArticleGenerationError(
+                    "word_count must be between 350 and 2500",
+                    error_code="VALIDATION_ERROR",
+                    failed_stage="validating_input",
+                    retryable=False,
+                    exc_type="ValueError",
+                )
+
         return {
             "submit_type": "generate_article",
             "user_id": str(submit_info["user_id"]).strip(),
             "canonical_doc_id": canonical_doc_id,
             "difficulty_level": difficulty_level,
             "personal_remarks": str(submit_info.get("personal_remarks", "")).strip(),
+            "word_count": word_count,
         }
 
     def _resolve_settings(self, submit_info: Dict[str, Any]) -> Dict[str, Any]:
-        target_words = {
-            "beginner": 350,
-            "intermediate": 500,
-            "expert": 650,
-        }[submit_info["difficulty_level"]]
-
         return {
             "outline_model": self.cfg.openai_article_outline_model,
             "writer_model": self.cfg.openai_article_writer_model,
             "intro_model": self.cfg.openai_article_intro_model,
             "embedding_model": self.cfg.openai_article_embedding_model,
+            "qa_model": self.cfg.openai_article_outline_model,
             "top_k_per_point": 6,
             "near_duplicate_threshold": 0.9,
-            "target_words_per_section": target_words,
+            "max_claims_per_section": 6,
+            "target_word_count": submit_info["word_count"],
             "max_sources_per_claim_in_prompt": 3,
         }
 
@@ -567,6 +634,8 @@ class GenerateArticle:
                 failed_stage="extracting_claim_bank",
                 retryable=False,
             )
+
+        self.quality_checker = ArticleQualityChecker(self.claim_id_to_claim, self.sid_to_url, self.claim_bank)
 
         return {
             "topic": topic,
@@ -726,6 +795,7 @@ Return JSON only:
         self,
         raw_retrieval: Dict[str, Any],
         near_duplicate_threshold: float,
+        max_claims_per_section: int,
     ) -> Dict[str, Any]:
         merged = {"sections": []}
 
@@ -768,6 +838,8 @@ Return JSON only:
                 ),
                 reverse=True,
             )
+            if max_claims_per_section > 0:
+                candidates = candidates[:max_claims_per_section]
 
             merged["sections"].append({
                 "subtopic": section["subtopic"],
@@ -785,8 +857,10 @@ Return JSON only:
         difficulty_level: str,
         personal_remarks: str,
         writer_model: str,
-        target_words_per_section: int,
+        target_word_count: int,
     ) -> List[Dict[str, Any]]:
+        section_count = max(len(retrieval["sections"]), 1)
+        target_words_per_section = max(100, target_word_count // section_count)
         full_coverage_map = self.coverage_map_text(outline)
         body_sections = []
         previous_text = ""
@@ -942,7 +1016,7 @@ Rules:
         personal_remarks: str,
         writer_model: str,
         intro_model: str,
-        target_words_per_section: int,
+        target_word_count: int,
         attempt_number: int,
     ) -> Dict[str, Any]:
         instructions = quality.get("repair_instructions", {})
@@ -951,6 +1025,8 @@ Rules:
         regenerate_intro = instructions.get("repair_intro", False)
         regenerate_conclusion = instructions.get("repair_conclusion", False)
         full_coverage_map = self.coverage_map_text(outline)
+        section_count = max(len(retrieval["sections"]), 1)
+        target_words_per_section = max(100, target_word_count // section_count)
 
         updated_sections = []
         previous_text = ""
@@ -1156,87 +1232,235 @@ Rules:
             "conclusion": str(result.get("conclusion", current_intro_conclusion.get("conclusion", ""))).strip(),
         }
 
-    def run_quality_checks(
+    def run_quality_checks_with_openai(
         self,
         retrieval: Dict[str, Any],
         body_sections: List[Dict[str, Any]],
         intro_conclusion: Dict[str, str],
-        article_with_claim_ids: str,
-        article_with_sources: str,
+        rendered: Dict[str, Any],
+        qa_model: str,
     ) -> Dict[str, Any]:
-        coverage_report = self.build_coverage_report(retrieval, body_sections, article_with_claim_ids)
-        unresolved_claim_ids = [
-            claim_id for claim_id in coverage_report["cited_claim_ids"]
-            if claim_id not in self.claim_id_to_claim
-        ]
-        empty_sections = [section["subtopic"] for section in body_sections if not section["body"].strip()]
-        missing_claim_sections = [
-            section["subtopic"] for section in retrieval["sections"] if not section["claims"]
-        ]
-        missing_source_urls = [
-            source_id for source_id in self.extract_source_ids(article_with_sources)
-            if source_id not in self.sid_to_url or not self.sid_to_url[source_id]
-        ]
-        uncited_sections = [
-            section["subtopic"]
-            for section in coverage_report["sections"]
-            if section["cited_claim_count"] == 0
-        ]
-        word_count = len(article_with_sources.split())
-        untagged_findings = self.locate_untagged_factual_sentences(body_sections, intro_conclusion)
-        unresolved_findings = self.locate_unresolved_claim_ids(article_with_claim_ids, unresolved_claim_ids, body_sections, intro_conclusion)
-        uncited_findings = [
-            {
-                "check": "cited_claims_per_section",
-                "location": f"section:{subtopic}",
-                "subtopic": subtopic,
-                "sentence": "",
-                "suggested_action": "regenerate_section",
-            }
-            for subtopic in uncited_sections
-        ]
-        missing_source_findings = [
-            {
-                "check": "missing_source_urls",
-                "location": self.locate_source_tag(article_with_sources, source_id),
-                "source_id": source_id,
-                "sentence": "",
-                "suggested_action": "rewrite_sentence_with_claim_tags",
-            }
-            for source_id in missing_source_urls
-        ]
+        untagged_findings = self.find_untagged_factual_sentences_with_openai(
+            retrieval=retrieval,
+            body_sections=body_sections,
+            intro_conclusion=intro_conclusion,
+            model=qa_model,
+        )
+        return self.quality_checker.run_quality_checks(
+            retrieval=retrieval,
+            body_sections=body_sections,
+            intro_conclusion=intro_conclusion,
+            article_with_claim_ids=rendered["article_with_claim_ids"],
+            article_with_sources=rendered["article_with_sources"],
+            untagged_findings=untagged_findings,
+        )
 
-        checks = {
-            "has_sections": bool(body_sections),
-            "has_citations": coverage_report["total_cited_claims"] > 0,
-            "untagged_factual_sentences": len(untagged_findings) == 0,
-            "unresolved_claim_ids": not unresolved_claim_ids,
-            "missing_claim_sections": not missing_claim_sections,
-            "missing_source_urls": not missing_source_urls,
-            "non_empty_sections": not empty_sections,
-            "cited_claims_per_section": not uncited_sections,
-            "minimum_word_count": word_count >= 300,
-        }
+    def find_untagged_factual_sentences_with_openai(
+        self,
+        retrieval: Dict[str, Any],
+        body_sections: List[Dict[str, Any]],
+        intro_conclusion: Dict[str, str],
+        model: str,
+    ) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        intro_claim_ids = self.extract_claim_ids(self.body_draft_markdown(body_sections))
 
-        failures = [name for name, passed in checks.items() if not passed]
-        findings = untagged_findings + unresolved_findings + uncited_findings + missing_source_findings
-        repairable_failures = set(failures) - {"missing_claim_sections", "has_sections"}
-        repairable = bool(repairable_failures)
+        findings.extend(
+            self.inspect_text_block_for_untagged_factual_sentences(
+                text=intro_conclusion.get("introduction", ""),
+                location="introduction",
+                allowed_claim_lines=self.claim_lines_by_ids(intro_claim_ids),
+                model=model,
+            )
+        )
 
-        return {
-            "passed": not failures,
-            "checks": checks,
-            "failures": failures,
-            "repairable": repairable,
-            "coverage_report": coverage_report,
-            "unresolved_claim_ids": unresolved_claim_ids,
-            "missing_source_urls": missing_source_urls,
-            "empty_sections": empty_sections,
-            "uncited_sections": uncited_sections,
-            "word_count": word_count,
-            "findings": findings,
-            "repair_instructions": self.summarize_repair_targets(findings, failures, body_sections),
-        }
+        for section in body_sections:
+            retrieval_section = next(
+                (item for item in retrieval["sections"] if item["subtopic"] == section["subtopic"]),
+                {"claims": []},
+            )
+            findings.extend(
+                self.inspect_text_block_for_untagged_factual_sentences(
+                    text=section.get("body", ""),
+                    location=f"section:{section['subtopic']}",
+                    subtopic=section["subtopic"],
+                    allowed_claim_lines=self.format_claim_lines(retrieval_section.get("claims", [])),
+                    model=model,
+                )
+            )
+
+        findings.extend(
+            self.inspect_text_block_for_untagged_factual_sentences(
+                text=intro_conclusion.get("conclusion", ""),
+                location="conclusion",
+                allowed_claim_lines=self.claim_lines_by_ids(intro_claim_ids),
+                model=model,
+            )
+        )
+        return findings
+
+    def inspect_text_block_for_untagged_factual_sentences(
+        self,
+        text: str,
+        location: str,
+        allowed_claim_lines: str,
+        model: str,
+        subtopic: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        paragraphs = self.split_paragraphs(text)
+        findings: List[Dict[str, Any]] = []
+
+        for paragraph_index, paragraph in enumerate(paragraphs, start=1):
+            prompt = f"""
+You are checking one article paragraph for unsupported inline citation formatting.
+
+Paragraph location:
+{location}
+
+Allowed claims:
+{allowed_claim_lines or "None"}
+
+Paragraph:
+{paragraph}
+
+Rules:
+- A factual sentence must end with one or more claim tags like [C0001].
+- Transitional, interpretive, or stylistic sentences do not need claim tags.
+- Do not flag sentences that already contain claim tags.
+- Be conservative. Only flag a sentence if it makes a concrete factual claim and lacks claim tags.
+
+Return JSON only:
+{{
+  "has_untagged_factual_sentences": true,
+  "sentences": ["exact sentence from the paragraph"]
+}}
+"""
+            result = self.ask_openai_json(
+                prompt,
+                model=model,
+                stage_name="quality_check",
+                temperature=0.0,
+            )
+            for sentence in result.get("sentences", []):
+                cleaned = str(sentence).strip()
+                if not cleaned or self.CLAIM_TAG_RE.search(cleaned):
+                    continue
+                finding = {
+                    "check": "untagged_factual_sentences",
+                    "location": location,
+                    "subtopic": subtopic,
+                    "paragraph_index": paragraph_index,
+                    "sentence": cleaned,
+                    "suggested_action": "rewrite_sentence_with_claim_tags" if location in {"introduction", "conclusion"} else "regenerate_section",
+                }
+                if finding not in findings:
+                    findings.append(finding)
+
+        return findings
+
+    def repair_untagged_paragraphs_with_openai(
+        self,
+        retrieval: Dict[str, Any],
+        body_sections: List[Dict[str, Any]],
+        intro_conclusion: Dict[str, str],
+        findings: List[Dict[str, Any]],
+        writer_model: str,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        untagged_findings = [f for f in findings if f.get("check") == "untagged_factual_sentences"]
+        if not untagged_findings:
+            return body_sections, intro_conclusion
+
+        grouped_findings: Dict[str, List[Dict[str, Any]]] = {}
+        for finding in untagged_findings:
+            grouped_findings.setdefault(finding["location"], []).append(finding)
+
+        body_claim_ids = self.extract_claim_ids(self.body_draft_markdown(body_sections))
+        updated_intro_conclusion = dict(intro_conclusion)
+        updated_sections: List[Dict[str, Any]] = []
+
+        if "introduction" in grouped_findings:
+            updated_intro_conclusion["introduction"] = self.rewrite_text_block_to_remove_untagged_factual_sentences(
+                text=intro_conclusion.get("introduction", ""),
+                location="introduction",
+                flagged_findings=grouped_findings["introduction"],
+                allowed_claim_lines=self.claim_lines_by_ids(body_claim_ids),
+                model=writer_model,
+            )
+
+        if "conclusion" in grouped_findings:
+            updated_intro_conclusion["conclusion"] = self.rewrite_text_block_to_remove_untagged_factual_sentences(
+                text=intro_conclusion.get("conclusion", ""),
+                location="conclusion",
+                flagged_findings=grouped_findings["conclusion"],
+                allowed_claim_lines=self.claim_lines_by_ids(body_claim_ids),
+                model=writer_model,
+            )
+
+        for section in body_sections:
+            location = f"section:{section['subtopic']}"
+            if location not in grouped_findings:
+                updated_sections.append(section)
+                continue
+
+            retrieval_section = next(
+                (item for item in retrieval["sections"] if item["subtopic"] == section["subtopic"]),
+                {"claims": []},
+            )
+            updated_sections.append({
+                **section,
+                "body": self.rewrite_text_block_to_remove_untagged_factual_sentences(
+                    text=section.get("body", ""),
+                    location=location,
+                    flagged_findings=grouped_findings[location],
+                    allowed_claim_lines=self.format_claim_lines(retrieval_section.get("claims", [])),
+                    model=writer_model,
+                ),
+            })
+
+        return updated_sections, updated_intro_conclusion
+
+    def rewrite_text_block_to_remove_untagged_factual_sentences(
+        self,
+        text: str,
+        location: str,
+        flagged_findings: List[Dict[str, Any]],
+        allowed_claim_lines: str,
+        model: str,
+    ) -> str:
+        prompt = f"""
+You are repairing one article text block after QA flagged uncited factual sentences.
+
+Block location:
+{location}
+
+Current text:
+{text}
+
+Flagged sentences:
+{json.dumps([finding.get("sentence", "") for finding in flagged_findings], ensure_ascii=False)}
+
+Allowed claims:
+{allowed_claim_lines or "None"}
+
+Rules:
+- Rewrite the full text block.
+- Every factual sentence must end with one or more claim tags like [C0001].
+- Use only the allowed claims.
+- Do not add new facts.
+- If a factual sentence cannot be supported by the allowed claims, remove it or convert it into non-factual transition text.
+- Preserve the original meaning when the claims support it.
+- Return plain text only. No markdown fences.
+"""
+        return self.ask_openai_text(
+            prompt,
+            model=model,
+            stage_name="repairing_article",
+            temperature=0.1,
+        ).strip()
+
+    @staticmethod
+    def split_paragraphs(text: str) -> List[str]:
+        return [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text.strip()) if paragraph.strip()]
 
     def _build_article_document(
         self,
@@ -1257,9 +1481,11 @@ Rules:
         final_error_code: str | None,
         final_failed_stage: str | None,
         total_runtime_seconds: float,
+        embedding_doc_id: str | None = None,
     ) -> Dict[str, Any]:
         created_at = datetime.utcnow().isoformat()
-        quality = quality or self.build_exception_quality("No quality information available")
+        quality = quality or self.quality_checker.build_exception_quality("No quality information available")
+        failed = status == "failed"
         return {
             "meta": {
                 "article_id": article_id,
@@ -1275,10 +1501,13 @@ Rules:
                 "created_at": created_at,
                 "attempt_count": len(attempt_history),
                 "max_attempts": self.MAX_REPAIR_ATTEMPTS,
-                "qa_required": status == "failed",
-                "repair_exhausted": status == "failed" and len(attempt_history) >= self.MAX_REPAIR_ATTEMPTS,
+                "qa_required": failed,
+                "repair_exhausted": failed and len(attempt_history) >= self.MAX_REPAIR_ATTEMPTS,
                 "final_error_code": final_error_code,
                 "final_failed_stage": final_failed_stage,
+                "failure_reasons": quality.get("failures", []) if failed else [],
+                "failure_message": quality.get("message") if failed else None,
+                "embedding_doc_id": embedding_doc_id,
             },
             "input": {
                 "submit_info": submit_info,
@@ -1300,8 +1529,8 @@ Rules:
             },
             "intermediate": {
                 "outline": outline,
-                "raw_retrieval": raw_retrieval,
-                "filtered_retrieval": retrieval,
+                "raw_retrieval": self._strip_embeddings_from_raw_retrieval(raw_retrieval),
+                "filtered_retrieval": self._strip_embeddings_from_filtered_retrieval(retrieval),
                 "body_sections": body_sections,
                 "intro_conclusion": intro_conclusion,
                 "used_source_ids": rendered["used_source_ids"],
@@ -1840,185 +2069,6 @@ Rules:
             ])
         return rendered, used_source_ids
 
-    @staticmethod
-    def looks_factual(sentence: str) -> bool:
-        sentence = sentence.strip()
-        if len(sentence.split()) < 8:
-            return False
-        lowered = sentence.lower()
-        if lowered.startswith(("overall,", "overall ", "in summary", "to conclude", "in practice", "for readers")):
-            return False
-        factual_markers = [
-            r"\b\d{3,4}\b",
-            r"\b\d+(\.\d+)?%",
-            r"\baccording to\b",
-            r"\bstudies\b",
-            r"\bevidence\b",
-            r"\bhistorically\b",
-            r"\bpolicy\b",
-            r"\beconomic\b",
-            r"\bscientific\b",
-            r"\bresearch\b",
-            r"\bsource\b",
-            r"\bdata\b",
-            r"\btheory\b",
-            r"\bmodel\b",
-            r"\bmeasured\b",
-            r"\breported\b",
-        ]
-        return any(re.search(pattern, sentence, flags=re.IGNORECASE) for pattern in factual_markers)
-
-    def flag_untagged_factual_sentences(self, article: str) -> List[str]:
-        sentences = self.sentence_split(article)
-        return [
-            sentence for sentence in sentences
-            if self.looks_factual(sentence) and not self.CLAIM_TAG_RE.search(sentence)
-        ]
-
-    def build_coverage_report(
-        self,
-        retrieval: Dict[str, Any],
-        body_sections: List[Dict[str, Any]],
-        final_article: str,
-    ) -> Dict[str, Any]:
-        cited_claim_ids = set(self.extract_claim_ids(final_article))
-        retrieved_claim_ids = set()
-        section_reports = []
-
-        for section in retrieval["sections"]:
-            section_claim_ids = [claim["claim_id"] for claim in section["claims"]]
-            retrieved_claim_ids.update(section_claim_ids)
-            body = next((item["body"] for item in body_sections if item["subtopic"] == section["subtopic"]), "")
-            section_cited = set(self.extract_claim_ids(body))
-            section_reports.append({
-                "subtopic": section["subtopic"],
-                "retrieved_claim_count": len(section_claim_ids),
-                "cited_claim_count": len(section_cited),
-                "unused_retrieved_claim_ids": sorted(set(section_claim_ids) - section_cited),
-                "cited_claim_ids": sorted(section_cited),
-            })
-
-        untagged_factual_sentences = self.flag_untagged_factual_sentences(final_article)
-        return {
-            "total_claim_bank_size": len(self.claim_bank),
-            "total_retrieved_claims": len(retrieved_claim_ids),
-            "total_cited_claims": len(cited_claim_ids),
-            "unused_retrieved_claims": sorted(retrieved_claim_ids - cited_claim_ids),
-            "cited_claim_ids": sorted(cited_claim_ids),
-            "untagged_factual_sentence_count": len(untagged_factual_sentences),
-            "untagged_factual_sentences": untagged_factual_sentences,
-            "sections": section_reports,
-        }
-
-    def locate_untagged_factual_sentences(
-        self,
-        body_sections: List[Dict[str, Any]],
-        intro_conclusion: Dict[str, str],
-    ) -> List[Dict[str, Any]]:
-        findings = []
-        for sentence in self.flag_untagged_factual_sentences(intro_conclusion.get("introduction", "")):
-            findings.append({
-                "check": "untagged_factual_sentences",
-                "location": "introduction",
-                "sentence": sentence,
-                "suggested_action": "rewrite_sentence_with_claim_tags",
-            })
-        for section in body_sections:
-            for sentence in self.flag_untagged_factual_sentences(section.get("body", "")):
-                findings.append({
-                    "check": "untagged_factual_sentences",
-                    "location": f"section:{section['subtopic']}",
-                    "subtopic": section["subtopic"],
-                    "sentence": sentence,
-                    "suggested_action": "regenerate_section",
-                })
-        for sentence in self.flag_untagged_factual_sentences(intro_conclusion.get("conclusion", "")):
-            findings.append({
-                "check": "untagged_factual_sentences",
-                "location": "conclusion",
-                "sentence": sentence,
-                "suggested_action": "rewrite_sentence_with_claim_tags",
-            })
-        return findings
-
-    def locate_unresolved_claim_ids(
-        self,
-        article_with_claim_ids: str,
-        unresolved_claim_ids: List[str],
-        body_sections: List[Dict[str, Any]],
-        intro_conclusion: Dict[str, str],
-    ) -> List[Dict[str, Any]]:
-        findings = []
-        for claim_id in unresolved_claim_ids:
-            location = "article"
-            if claim_id in intro_conclusion.get("introduction", ""):
-                location = "introduction"
-            elif claim_id in intro_conclusion.get("conclusion", ""):
-                location = "conclusion"
-            else:
-                for section in body_sections:
-                    if claim_id in section.get("body", ""):
-                        location = f"section:{section['subtopic']}"
-                        break
-            findings.append({
-                "check": "unresolved_claim_ids",
-                "location": location,
-                "sentence": self.extract_sentence_containing(article_with_claim_ids, claim_id),
-                "claim_id": claim_id,
-                "subtopic": location.split("section:", 1)[1] if location.startswith("section:") else None,
-                "suggested_action": "rewrite_sentence_with_claim_tags",
-            })
-        return findings
-
-    @staticmethod
-    def extract_sentence_containing(text: str, token: str) -> str:
-        for sentence in re.split(r"(?<=[.!?])\s+", text):
-            if token in sentence:
-                return sentence.strip()
-        return ""
-
-    def locate_source_tag(self, article_with_sources: str, source_id: str) -> str:
-        token = f"[^{source_id}]"
-        for sentence in re.split(r"(?<=[.!?])\s+", article_with_sources):
-            if token in sentence:
-                return self.infer_location_from_rendered_article(sentence)
-        return "article"
-
-    @staticmethod
-    def infer_location_from_rendered_article(sentence: str) -> str:
-        return "article"
-
-    def summarize_repair_targets(
-        self,
-        findings: List[Dict[str, Any]],
-        failures: List[str],
-        body_sections: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        section_targets = sorted({
-            finding.get("subtopic")
-            for finding in findings
-            if finding.get("subtopic")
-        })
-        locations = {finding.get("location") for finding in findings}
-        regenerate_all_sections = False
-        if "missing_claim_sections" in failures or not section_targets and any(
-            failure in failures for failure in ["minimum_word_count", "has_sections", "non_empty_sections"]
-        ):
-            regenerate_all_sections = True
-        if not section_targets and "untagged_factual_sentences" in failures and "introduction" not in locations and "conclusion" not in locations:
-            regenerate_all_sections = True
-        if not section_targets and "unresolved_claim_ids" in failures and all(
-            location in {"introduction", "conclusion", "article"} for location in locations if location
-        ):
-            regenerate_all_sections = True
-
-        return {
-            "section_targets": section_targets,
-            "repair_intro": "introduction" in locations or regenerate_all_sections,
-            "repair_conclusion": "conclusion" in locations or regenerate_all_sections,
-            "regenerate_all_sections": regenerate_all_sections,
-        }
-
     def build_attempt_record(
         self,
         attempt_number: int,
@@ -2039,47 +2089,146 @@ Rules:
             "repair_instructions": repair_instructions or {},
         }
 
-    def build_exception_quality(self, message: str) -> Dict[str, Any]:
+    def resolve_untagged_sentences(
+        self,
+        body_sections: List[Dict[str, Any]],
+        intro_conclusion: Dict[str, str],
+        findings: List[Dict[str, Any]],
+        embedding_model: str,
+        similarity_threshold: float = 0.75,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        untagged = [f for f in findings if f.get("check") == "untagged_factual_sentences"]
+        if not untagged or not self.claim_bank:
+            return body_sections, intro_conclusion
+
+        unique_sentences = list({f["sentence"] for f in untagged if f.get("sentence")})
+        if not unique_sentences:
+            return body_sections, intro_conclusion
+
+        sentence_embeddings = self.embed_texts(unique_sentences, embedding_model, "quality_check")
+
+        resolved: Dict[str, str | None] = {}
+        for sentence, sentence_emb in zip(unique_sentences, sentence_embeddings):
+            best_score = 0.0
+            best_claim_id = None
+            for claim in self.claim_bank:
+                score = self.cosine_similarity(sentence_emb, claim["embedding"])
+                if score > best_score:
+                    best_score = score
+                    best_claim_id = claim["claim_id"]
+            resolved[sentence] = best_claim_id if best_score >= similarity_threshold else None
+
+        intro_sentences = {f["sentence"] for f in untagged if f.get("location") == "introduction"}
+        conclusion_sentences = {f["sentence"] for f in untagged if f.get("location") == "conclusion"}
+        section_sentences: Dict[str, set] = {}
+        for f in untagged:
+            if f.get("location", "").startswith("section:"):
+                section_sentences.setdefault(f["subtopic"], set()).add(f["sentence"])
+
+        def apply_fixes(text: str, sentences_to_fix: set) -> str:
+            for sentence in sentences_to_fix:
+                claim_id = resolved.get(sentence)
+                if claim_id:
+                    text = text.replace(sentence, self._insert_claim_tag(sentence, claim_id))
+                else:
+                    text = text.replace(sentence, "")
+            return re.sub(r" {2,}", " ", text).strip()
+
+        updated_intro = apply_fixes(intro_conclusion.get("introduction", ""), intro_sentences)
+        updated_conclusion = apply_fixes(intro_conclusion.get("conclusion", ""), conclusion_sentences)
+
+        updated_sections = []
+        for section in body_sections:
+            sentences_for_section = section_sentences.get(section["subtopic"], set())
+            if sentences_for_section:
+                updated_sections.append({**section, "body": apply_fixes(section["body"], sentences_for_section)})
+            else:
+                updated_sections.append(section)
+
+        return updated_sections, {**intro_conclusion, "introduction": updated_intro, "conclusion": updated_conclusion}
+
+    @staticmethod
+    def _insert_claim_tag(sentence: str, claim_id: str) -> str:
+        if sentence and sentence[-1] in ".!?":
+            return f"{sentence[:-1]} [{claim_id}]{sentence[-1]}"
+        return f"{sentence} [{claim_id}]"
+
+    def _build_embedding_document(
+        self,
+        article_id: str,
+        submit_info: Dict[str, Any],
+        source_context: Dict[str, Any],
+        settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
         return {
-            "passed": False,
-            "checks": {},
-            "failures": ["pipeline_error"],
-            "repairable": False,
-            "coverage_report": {
-                "total_claim_bank_size": len(self.claim_bank),
-                "total_retrieved_claims": 0,
-                "total_cited_claims": 0,
-                "unused_retrieved_claims": [],
-                "cited_claim_ids": [],
-                "untagged_factual_sentence_count": 0,
-                "untagged_factual_sentences": [],
-                "sections": [],
+            "meta": {
+                "article_id": article_id,
+                "canonical_source_mongo_id": source_context["source_doc_id"],
+                "user_id": submit_info["user_id"],
+                "type": "article_embedding",
+                "embedding_model": settings["embedding_model"],
+                "claim_count": len(self.claim_bank),
+                "created_at": datetime.utcnow().isoformat(),
             },
-            "unresolved_claim_ids": [],
-            "missing_source_urls": [],
-            "empty_sections": [],
-            "uncited_sections": [],
-            "word_count": 0,
-            "findings": [],
-            "repair_instructions": {},
-            "message": message,
+            "claims": [
+                {
+                    "claim_id": claim["claim_id"],
+                    "text": claim["text"],
+                    "embedding": claim["embedding"],
+                    "trust_label": claim["trust_label"],
+                    "source_ids": claim["source_ids"],
+                }
+                for claim in self.claim_bank
+            ],
         }
 
-    @staticmethod
-    def build_quality_summary(quality: Dict[str, Any]) -> Dict[str, Any]:
-        quality = quality or {}
-        coverage = quality.get("coverage_report", {})
-        return {
-            "passed": quality.get("passed", False),
-            "failures": quality.get("failures", []),
-            "total_cited_claims": coverage.get("total_cited_claims", 0),
-            "untagged_factual_sentence_count": coverage.get("untagged_factual_sentence_count", 0),
-            "unresolved_claim_count": len(quality.get("unresolved_claim_ids", [])),
-        }
+    def _persist_embedding_document(self, embedding_doc: Dict[str, Any], mongoio: MongoDBHandler):
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                return mongoio.write_document(embedding_doc)
+            except Exception as exc:
+                self.usage["retries"] += 1
+                last_exc = exc
+                if attempt == 3:
+                    raise ArticleGenerationError(
+                        f"Failed to persist embedding document: {exc}",
+                        error_code="MONGO_ERROR",
+                        failed_stage="persisting_document",
+                        retryable=True,
+                    ) from exc
+                time.sleep(1)
+        raise ArticleGenerationError(
+            f"Failed to persist embedding document: {last_exc}",
+            error_code="MONGO_ERROR",
+            failed_stage="persisting_document",
+            retryable=True,
+        )
 
     @staticmethod
-    def extract_source_ids(article_with_sources: str) -> List[str]:
-        return sorted(set(re.findall(r"\[\^(S\d{3})\]", article_with_sources)))
+    def _strip_embeddings_from_filtered_retrieval(retrieval: Dict[str, Any]) -> Dict[str, Any]:
+        sections = []
+        for section in retrieval.get("sections", []):
+            claims = [
+                {k: v for k, v in claim.items() if k != "embedding"}
+                for claim in section.get("claims", [])
+            ]
+            sections.append({**section, "claims": claims})
+        return {"sections": sections}
+
+    @staticmethod
+    def _strip_embeddings_from_raw_retrieval(raw_retrieval: Dict[str, Any]) -> Dict[str, Any]:
+        sections = []
+        for section in raw_retrieval.get("sections", []):
+            point_hits = []
+            for point_hit in section.get("point_hits", []):
+                hits = [
+                    {k: v for k, v in hit.items() if k != "embedding"}
+                    for hit in point_hit.get("hits", [])
+                ]
+                point_hits.append({**point_hit, "hits": hits})
+            sections.append({**section, "point_hits": point_hits})
+        return {"sections": sections}
 
     @staticmethod
     def _format_openai_error(exc: Exception) -> str:

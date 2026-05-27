@@ -40,6 +40,10 @@ class Config:
             'GENERATED_ARTICLE_COLLECTION_NAME',
             env_type + '_generated_article'
         )
+        self.article_embedding_collection_name = os.getenv(
+            'ARTICLE_EMBEDDING_COLLECTION_NAME',
+            env_type + '_embedding'
+        )
         self.tavily_api_key = os.getenv('TAVILY_API_KEY')
 
         self.openai_autoquiz_model = os.getenv('OPENAI_AUTOQUIZ_MODEL', 'gpt-4o-mini')
